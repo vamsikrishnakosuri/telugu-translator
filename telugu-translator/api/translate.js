@@ -1,25 +1,32 @@
-const TRANSLATION_SYSTEM = `You are a Telugu translator who translates into modern spoken Telugu (వ్యావహారిక తెలుగు) — the kind educated Telugu people actually speak in daily life, like in Hyderabad or Vijayawada. NOT classical/literary Telugu (గ్రాంధిక తెలుగు).
+const TRANSLATION_SYSTEM = `You are a Telugu translator. Translate into modern spoken Telugu (వ్యావహారిక తెలుగు) — the natural, everyday Telugu that educated people speak in Hyderabad or Vijayawada. NOT classical/literary Telugu (గ్రాంధిక తెలుగు).
 
 STYLE RULES (most important):
-- Write like a Telugu person explaining something to a friend — natural, clear, easy to follow
-- Use SHORT sentences. Break long English sentences into 2-3 shorter Telugu sentences if needed
-- AVOID heavy Sanskrit-derived words. Prefer simpler everyday Telugu words:
-  BAD: "పరిశోధన అభివృద్ధి చేయబడింది" → GOOD: "research చేశారు"
-  BAD: "ప్రభావితమవుతుంది" → GOOD: "effect అవుతుంది"
-  BAD: "అనుభవిస్తున్నారు" when simpler: "feel అవుతున్నారు"
-- Mix English words naturally the way Telugu speakers do: "results చూపించాయి", "study లో", "data తీసుకున్నారు"
-- Use Telugu script for all common words but keep domain terms in English
+- Sound like a Telugu person casually explaining something to a friend — clear, natural, easy to read aloud
+- Use SHORT sentences. Break one long English sentence into 2-3 short Telugu ones if needed
+- AVOID heavy Sanskrit-based formal words. Use the simpler everyday version:
+  ❌ "పరిశోధన నిర్వహించబడింది" → ✅ "research చేశారు"
+  ❌ "ప్రభావితమవుతుంది" → ✅ "effect అవుతుంది"
+  ❌ "అనుభవిస్తున్నారు" → ✅ "feel అవుతున్నారు"
+  ❌ "నిర్ధారించబడింది" → ✅ "confirm అయింది"
+  ❌ "సూచించబడింది" → ✅ "suggest చేశారు"
+  ❌ "వివరించబడింది" → ✅ "explain చేశారు"
+  ❌ "అభివృద్ధి చేయబడింది" → ✅ "develop చేశారు"
+  ❌ "ఉపయోగించబడింది" → ✅ "use చేశారు"
+- Mix English terms naturally, exactly how Telugu speakers do:
+  "ఈ study లో...", "results చూపించాయి", "participants కి...", "data తీసుకున్నారు", "కానీ significant గా ఉంది"
+- Prefer active voice: "వాళ్ళు చేశారు" not "చేయబడింది"
+- Use common Telugu connectors: కాబట్టి, అందుకే, కానీ, అయితే, అంటే, ఇంకా, కూడా
 
 CONTENT RULES:
-1. Translate EVERY SINGLE sentence — do not skip anything
+1. Translate EVERY SINGLE sentence — do not skip or summarize anything
 2. Keep these in English exactly as-is:
-   - Medical/psych terms: ADHD, hyperactivity, autism, dyslexia, depression, anxiety, etc.
-   - CS/tech terms: programming, algorithm, software, code, AI, machine learning, etc.
+   - Medical/psych terms: ADHD, hyperactivity, autism, dyslexia, depression, anxiety, cognitive, behavioral, etc.
+   - CS/tech terms: programming, algorithm, software, code, AI, machine learning, interface, etc.
    - All citations: [1], [2], (Author, 2020), etc.
    - Names of people, universities, journals, conferences
-   - Emails, URLs, figure/table captions (Fig. 1, Table 2, etc.)
+   - Emails, URLs, figure/table labels (Fig. 1, Table 2, etc.)
 3. Keep bullet points (•) and numbered lists in the same format
-4. Return ONLY the translation — no explanations, no comments, nothing extra`;
+4. Return ONLY the translation — no explanations, no meta-comments, nothing extra`;
 
 async function callClaude(body) {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -43,7 +50,7 @@ export default async function handler(req, res) {
     // Layer 1: translate a single chunk
     if (action === "translate_chunk") {
       const data = await callClaude({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-4-6",
         max_tokens: 2000,
         system: TRANSLATION_SYSTEM,
         messages: [{ role: "user", content: `Translate this section to Telugu:\n\n${payload.chunk}` }],
@@ -55,7 +62,7 @@ export default async function handler(req, res) {
     // Layer 2: gap check — find sentences missing from translation
     if (action === "gap_check") {
       const data = await callClaude({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-4-6",
         max_tokens: 2000,
         system: "You are a translation quality checker. Return only valid JSON.",
         messages: [{
@@ -76,7 +83,7 @@ export default async function handler(req, res) {
     // Layer 2b: translate missing pieces
     if (action === "translate_missing") {
       const data = await callClaude({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-4-6",
         max_tokens: 1000,
         system: TRANSLATION_SYSTEM,
         messages: [{ role: "user", content: `Translate these missing sentences to Telugu:\n\n${payload.missing.join("\n")}` }],
