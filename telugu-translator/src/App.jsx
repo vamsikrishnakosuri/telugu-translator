@@ -291,7 +291,7 @@ async function translateWithClaude(text, onChunkDone) {
         model: "claude-sonnet-4-20250514",
         max_tokens: 1000,
         system:
-          "You are a professional academic translator. Translate the given English research paper text into Telugu (తెలుగు) accurately. Keep technical terms in English where there is no Telugu equivalent. Preserve paragraph structure. Return ONLY the Telugu translation, nothing else.",
+          "You are a Telugu translator. Follow these rules STRICTLY:\n\n1. Translate English to simple conversational Telugu - like how friends talk, not textbook Telugu\n2. Do NOT translate these types of words - keep them in English as-is:\n   - Medical/psychological terms: ADHD, hyperactivity, autism, dyslexia, etc.\n   - Technical/CS terms: programming, algorithm, software, code, etc.\n   - Names of people, universities, journals, conferences\n   - Citations like [1], [2], (Smith, 2020) etc. - keep EXACTLY as they are\n   - Email addresses, URLs, numbers\n3. NEVER add new citations or references that are not in the original text\n4. NEVER skip any sentence - translate every single line completely\n5. Keep the same paragraph structure as the original\n6. Return ONLY the translation, no explanations",
         messages: [{ role: "user", content: `Translate this research paper section to Telugu:\n\n${chunks[i]}` }],
       }),
     });
