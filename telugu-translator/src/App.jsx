@@ -237,7 +237,7 @@ async function loadTeluguFont() {
   if (cachedTeluguFontBytes) return cachedTeluguFontBytes;
   try {
     const res = await fetch(
-      "https://fonts.gstatic.com/s/notoseriftelugu/v24/neIQzCKvrIcn5pbuuuriV9tXQnhCYBc.ttf"
+      "https://fonts.gstatic.com/s/notoseriftelugu/v29/tDbl2pCbnkEKmXNVmt2M1q6f4HWbbj6MRbYEeav7Fe9D9TCwuQ.ttf"
     );
     if (!res.ok) throw new Error("fetch failed");
     cachedTeluguFontBytes = await res.arrayBuffer();
@@ -780,7 +780,7 @@ export default function App() {
                 ? pdfPages.map((dataUrl, pageIdx) => {
                     const chunkIdx = pageToChunk(pageIdx);
                     const chunkText = translatedChunks[chunkIdx];
-                    const isActiveChunk = status === "translating" && progress.current - 1 === chunkIdx;
+                    const isActiveChunk = status === "translating" && chunkProgress.current - 1 === chunkIdx;
                     return (
                       <div key={pageIdx} className="fade-in" style={styles.pageCard}>
                         <div style={styles.pageLabel}>PAGE {pageIdx + 1}</div>
