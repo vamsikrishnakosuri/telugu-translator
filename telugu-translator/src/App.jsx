@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 
 const COLORS = {
   bg: "#0f0e17",
@@ -230,6 +230,25 @@ styleTag.textContent = `
 `;
 document.head.appendChild(styleTag);
 
+// ─── Telugu font (preloaded at module init) ───────────────────────────────────
+
+let cachedTeluguFontBytes = null;
+async function loadTeluguFont() {
+  if (cachedTeluguFontBytes) return cachedTeluguFontBytes;
+  try {
+    const res = await fetch(
+      "https://fonts.gstatic.com/s/notoseriftelugu/v24/neIQzCKvrIcn5pbuuuriV9tXQnhCYBc.ttf"
+    );
+    if (!res.ok) throw new Error("fetch failed");
+    cachedTeluguFontBytes = await res.arrayBuffer();
+    return cachedTeluguFontBytes;
+  } catch (e) {
+    console.warn("Telugu font load failed:", e.message);
+    return null;
+  }
+}
+loadTeluguFont(); // kick off immediately
+
 // ─── PDF.js helpers ───────────────────────────────────────────────────────────
 
 async function loadPDFJS() {
@@ -274,6 +293,115 @@ async function renderPDFPages(file, onPage) {
     await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
     onPage(i - 1, canvas.toDataURL("image/jpeg", 0.82));
   }
+}
+
+// ─── PDF builder ─────────────────────────────────────────────────────────────
+
+async function buildTranslatedPDF(originalFile, translatedChunks, onProgress) {
+  const { PDFDocument, rgb, StandardFonts } = await import("pdf-lib");
+
+  const originalBytes = await originalFile.arrayBuffer();
+
+  // pdf-lib and PDF.js each get their own Uint8Array view of the same bytes
+  const pdfDoc = await PDFDocument.load(new Uint8Array(originalBytes));
+  const pages = pdfDoc.getPages();
+
+  // Embed Telugu font (with Helvetica fallback)
+  let teluguFont;
+  try {
+    const fontBytes = await loadTeluguFont();
+    if (!fontBytes) throw new Error("no bytes");
+    teluguFont = await pdfDoc.embedFont(new Uint8Array(fontBytes), { subset: false });
+  } catch (e) {
+    console.warn("Telugu font embed failed — using Helvetica fallback:", e.message);
+    teluguFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  }
+
+  const pdfjsLib = await loadPDFJS();
+  const pdfJsDoc = await pdfjsLib.getDocument({ data: new Uint8Array(originalBytes) }).promise;
+
+  const numPages = pages.length;
+  const validChunks = translatedChunks.filter(Boolean);
+
+  for (let pageIdx = 0; pageIdx < numPages; pageIdx++) {
+    onProgress && onProgress(pageIdx + 1, numPages);
+
+    const page = pages[pageIdx];
+    const { width, height } = page.getSize();
+
+    const pdfJsPage = await pdfJsDoc.getPage(pageIdx + 1);
+    const textContent = await pdfJsPage.getTextContent();
+    const items = textContent.items.filter((i) => i.str && i.str.trim());
+    if (!items.length) continue;
+
+    // ── Cover original text with white rectangles ──────────────────────────
+    for (const item of items) {
+      const x = item.transform[4];
+      const y = item.transform[5];
+      const iw = Math.max(item.width || 5, 5);
+      const ih = Math.max(item.height || 10, 5);
+      try {
+        page.drawRectangle({
+          x: Math.max(0, x - 1),
+          y: Math.max(0, y - 2),
+          width: Math.min(iw + 3, width - Math.max(0, x - 1)),
+          height: ih + 4,
+          color: rgb(1, 1, 1),
+        });
+      } catch (_) {}
+    }
+
+    // ── Compute text-area bounding box ─────────────────────────────────────
+    const allX = items.map((i) => i.transform[4]);
+    const allY = items.map((i) => i.transform[5]);
+    const allH = items.map((i) => i.height || 10);
+    const minX = Math.min(...allX);
+    const maxY = Math.max(...allY.map((y, i) => y + allH[i]));
+    const textAreaWidth = Math.max(...items.map((i) => i.transform[4] + (i.width || 0))) - minX;
+    const avgH = allH.reduce((a, b) => a + b, 0) / allH.length;
+
+    // ── Pick translated text for this page ─────────────────────────────────
+    const chunkIdx = Math.min(
+      Math.floor((pageIdx / numPages) * validChunks.length),
+      validChunks.length - 1
+    );
+    const pageText = validChunks[chunkIdx] || "";
+    if (!pageText.trim()) continue;
+
+    // ── Word-wrap and draw ─────────────────────────────────────────────────
+    const fontSize = Math.max(7, Math.min(avgH * 0.85, 12));
+    const lineH = fontSize * 1.5;
+
+    const words = pageText.replace(/\n+/g, " ").split(/\s+/).filter(Boolean);
+    const lines = [];
+    let cur = "";
+    for (const word of words) {
+      const test = cur ? cur + " " + word : word;
+      let w = 0;
+      try { w = teluguFont.widthOfTextAtSize(test, fontSize); }
+      catch (_) { w = test.length * fontSize * 0.55; }
+      if (w > textAreaWidth && cur) { lines.push(cur); cur = word; }
+      else { cur = test; }
+    }
+    if (cur) lines.push(cur);
+
+    let curY = maxY;
+    for (const line of lines) {
+      if (curY < 20) break;
+      try {
+        page.drawText(line, {
+          x: minX,
+          y: Math.min(curY, height - fontSize - 5),
+          size: fontSize,
+          font: teluguFont,
+          color: rgb(0, 0, 0),
+        });
+      } catch (_) {}
+      curY -= lineH;
+    }
+  }
+
+  return pdfDoc.save();
 }
 
 // ─── Translation helpers ──────────────────────────────────────────────────────
@@ -385,8 +513,13 @@ export default function App() {
   const [translatedChunks, setTranslatedChunks] = useState([]);
   const [stats, setStats] = useState(null); // { chunksTotal, missingLines, citationsTotal, citationsMissing }
   const [error, setError] = useState("");
+  const [downloadBuilding, setDownloadBuilding] = useState(false);
+  const [downloadSize, setDownloadSize] = useState(null); // bytes
   const inputRef = useRef();
   const textSectionRef = useRef();
+
+  // Ensure Telugu font is warm in the cache as soon as the app mounts
+  useEffect(() => { loadTeluguFont(); }, []);
 
   const fullTranslation = translatedChunks.filter(Boolean).join("\n\n");
   const hasTranslation = translatedChunks.some(Boolean);
@@ -441,14 +574,38 @@ export default function App() {
     }
   };
 
-  const handleDownload = () => {
-    const blob = new Blob([fullTranslation], { type: "text/plain;charset=utf-8" });
-    const a = Object.assign(document.createElement("a"), {
-      href: URL.createObjectURL(blob),
-      download: `${file?.name?.replace(".pdf", "") || "translation"}_telugu.txt`,
-    });
-    a.click();
-    URL.revokeObjectURL(a.href);
+  const handleDownload = async () => {
+    if (downloadBuilding) return;
+    setDownloadBuilding(true);
+    try {
+      const pdfBytes = await buildTranslatedPDF(
+        file,
+        translatedChunks.filter(Boolean),
+        (current, total) => {
+          setProgressMsg(`Building PDF… page ${current} of ${total}`);
+        }
+      );
+      const blob = new Blob([pdfBytes], { type: "application/pdf" });
+      setDownloadSize(blob.size);
+      const a = Object.assign(document.createElement("a"), {
+        href: URL.createObjectURL(blob),
+        download: `${file?.name?.replace(".pdf", "") || "translation"}_telugu.pdf`,
+      });
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) {
+      console.error("PDF build failed:", e);
+      // Fallback: download as plain text
+      const blob = new Blob([fullTranslation], { type: "text/plain;charset=utf-8" });
+      const a = Object.assign(document.createElement("a"), {
+        href: URL.createObjectURL(blob),
+        download: `${file?.name?.replace(".pdf", "") || "translation"}_telugu.txt`,
+      });
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } finally {
+      setDownloadBuilding(false);
+    }
   };
 
   const progressPct = chunkProgress.total > 0
@@ -605,7 +762,13 @@ export default function App() {
               {/* Sticky action bar */}
               {isDone && (
                 <div style={styles.stickyBar}>
-                  <button style={styles.actionBtnFill} onClick={handleDownload}>⬇️ Download Telugu PDF</button>
+                  <button style={{ ...styles.actionBtnFill, opacity: downloadBuilding ? 0.7 : 1 }} onClick={handleDownload} disabled={downloadBuilding}>
+                    {downloadBuilding
+                      ? <><span style={styles.spinner} />Building PDF…</>
+                      : downloadSize
+                        ? `⬇️ Download Telugu PDF (${(downloadSize / 1024 / 1024).toFixed(1)} MB)`
+                        : "⬇️ Download Telugu PDF"}
+                  </button>
                   <button style={styles.actionBtnOutline} onClick={() => textSectionRef.current?.scrollIntoView({ behavior: "smooth" })}>
                     📖 Read here
                   </button>
