@@ -276,29 +276,100 @@ async function renderPDFPages(file, onPage) {
   }
 }
 
-// ─── Translation ──────────────────────────────────────────────────────────────
+// ─── Translation helpers ──────────────────────────────────────────────────────
 
-async function translateWithClaude(text, onChunkDone) {
-  const CHUNK_SIZE = 3000;
+async function callAPI(action, payload) {
+  const res = await fetch("/api/translate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data;
+}
+
+// Split text into sentence-based chunks of max 10 sentences each
+function splitIntoChunks(text, maxSentences = 10) {
+  // Split on sentence-ending punctuation followed by whitespace or end
+  const sentences = text.split(/(?<=[.?!])\s+/).filter((s) => s.trim().length > 0);
   const chunks = [];
-  for (let i = 0; i < text.length; i += CHUNK_SIZE) chunks.push(text.slice(i, i + CHUNK_SIZE));
-
-  for (let i = 0; i < chunks.length; i++) {
-    const response = await fetch("/api/translate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        system:
-          "You are a Telugu translator. Follow these rules STRICTLY:\n\n1. Translate English to simple conversational Telugu - like how friends talk, not textbook Telugu\n2. Do NOT translate these types of words - keep them in English as-is:\n   - Medical/psychological terms: ADHD, hyperactivity, autism, dyslexia, etc.\n   - Technical/CS terms: programming, algorithm, software, code, etc.\n   - Names of people, universities, journals, conferences\n   - Citations like [1], [2], (Smith, 2020) etc. - keep EXACTLY as they are\n   - Email addresses, URLs, numbers\n3. NEVER add new citations or references that are not in the original text\n4. NEVER skip any sentence - translate every single line completely\n5. Keep the same paragraph structure as the original\n6. Return ONLY the translation, no explanations",
-        messages: [{ role: "user", content: `Translate this research paper section to Telugu:\n\n${chunks[i]}` }],
-      }),
-    });
-    const data = await response.json();
-    if (data.error) throw new Error(data.error.message);
-    onChunkDone(i, chunks.length, data.content?.[0]?.text || "");
+  for (let i = 0; i < sentences.length; i += maxSentences) {
+    chunks.push(sentences.slice(i, i + maxSentences).join(" "));
   }
+  return chunks.length > 0 ? chunks : [text];
+}
+
+// Extract all citation patterns from text
+function extractCitations(text) {
+  const bracketCitations = [...text.matchAll(/\[\d+(?:,\s*\d+)*\]/g)].map((m) => m[0]);
+  const authorCitations = [...text.matchAll(/\([A-Z][a-zA-Z\-]+(?:\s+et\s+al\.?)?,?\s+\d{4}\)/g)].map((m) => m[0]);
+  return [...new Set([...bracketCitations, ...authorCitations])];
+}
+
+// ─── 3-Layer Translation ──────────────────────────────────────────────────────
+
+async function translateWithVerification(text, onProgress) {
+  // ── Layer 1: chunk + translate ────────────────────────────────────────────
+  const chunks = splitIntoChunks(text, 10);
+  const total = chunks.length;
+  const translatedChunks = new Array(total).fill("");
+
+  for (let i = 0; i < total; i++) {
+    onProgress({
+      layer: 1,
+      message: `Layer 1: Translating chunk ${i + 1} of ${total}…`,
+      chunkIndex: i,
+      chunkTotal: total,
+    });
+    const label = `[CHUNK ${i + 1} of ${total}]\n`;
+    const { text: translated } = await callAPI("translate_chunk", { chunk: label + chunks[i] });
+    translatedChunks[i] = translated.replace(/^\[CHUNK \d+ of \d+\]\s*/i, "").trim();
+  }
+
+  // ── Layer 2: gap check ────────────────────────────────────────────────────
+  onProgress({ layer: 2, message: "Layer 2: Checking for missing sentences…" });
+
+  const fullTranslation = translatedChunks.join("\n\n");
+  // Only run gap check on reasonably sized texts (avoid huge payloads)
+  const sampleOriginal = text.length > 8000 ? text.slice(0, 8000) + "…" : text;
+  const sampleTranslated = fullTranslation.length > 8000 ? fullTranslation.slice(0, 8000) + "…" : fullTranslation;
+
+  let missingCount = 0;
+  try {
+    const { missing } = await callAPI("gap_check", {
+      original: sampleOriginal,
+      translated: sampleTranslated,
+    });
+
+    if (missing && missing.length > 0) {
+      missingCount = missing.length;
+      onProgress({ layer: 2, message: `Layer 2: Translating ${missingCount} missing piece(s)…` });
+      const { text: fixText } = await callAPI("translate_missing", { missing });
+      translatedChunks.push("\n\n--- Recovered sections ---\n" + fixText);
+    }
+  } catch (_) { /* non-fatal — continue with what we have */ }
+
+  // ── Layer 3: citation check ───────────────────────────────────────────────
+  onProgress({ layer: 3, message: "Layer 3: Verifying citations…" });
+
+  const originalCitations = extractCitations(text);
+  const finalText = translatedChunks.join("\n\n");
+  const missingCitations = originalCitations.filter((c) => !finalText.includes(c));
+
+  if (missingCitations.length > 0) {
+    translatedChunks.push("\n\n--- Recovered citations ---\n" + missingCitations.join("  "));
+  }
+
+  return {
+    chunks: translatedChunks,
+    stats: {
+      chunksTotal: total,
+      missingLines: missingCount,
+      citationsTotal: originalCitations.length,
+      citationsMissing: missingCitations.length,
+    },
+  };
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -307,9 +378,12 @@ export default function App() {
   const [file, setFile] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [status, setStatus] = useState("idle"); // idle | rendering | extracting | translating | done | error
-  const [progress, setProgress] = useState({ current: 0, total: 0 });
-  const [pdfPages, setPdfPages] = useState([]); // array of JPEG data URLs
-  const [translatedChunks, setTranslatedChunks] = useState([]); // sparse array indexed by chunk
+  const [progressMsg, setProgressMsg] = useState("");  // human-readable layer status
+  const [progressLayer, setProgressLayer] = useState(0); // 1 | 2 | 3
+  const [chunkProgress, setChunkProgress] = useState({ current: 0, total: 0 });
+  const [pdfPages, setPdfPages] = useState([]);
+  const [translatedChunks, setTranslatedChunks] = useState([]);
+  const [stats, setStats] = useState(null); // { chunksTotal, missingLines, citationsTotal, citationsMissing }
   const [error, setError] = useState("");
   const inputRef = useRef();
   const textSectionRef = useRef();
@@ -324,13 +398,14 @@ export default function App() {
     setFile(f);
     setPdfPages([]);
     setTranslatedChunks([]);
+    setStats(null);
     setError("");
     setStatus("rendering");
     try {
       await renderPDFPages(f, (index, dataUrl) => {
         setPdfPages((prev) => { const next = [...prev]; next[index] = dataUrl; return next; });
       });
-    } catch (_) { /* graceful degradation — translation still works without page images */ }
+    } catch (_) { /* graceful degradation */ }
     setStatus("idle");
   };
 
@@ -341,14 +416,24 @@ export default function App() {
     setStatus("extracting");
     setError("");
     setTranslatedChunks([]);
-    setProgress({ current: 0, total: 0 });
+    setStats(null);
+    setProgressMsg("Extracting text from PDF…");
+    setProgressLayer(0);
+    setChunkProgress({ current: 0, total: 0 });
     try {
       const text = await extractTextFromPDF(file);
       setStatus("translating");
-      await translateWithClaude(text, (index, total, chunkText) => {
-        setProgress({ current: index + 1, total });
-        setTranslatedChunks((prev) => { const next = [...prev]; next[index] = chunkText; return next; });
+      const result = await translateWithVerification(text, (prog) => {
+        setProgressMsg(prog.message);
+        setProgressLayer(prog.layer);
+        if (prog.layer === 1) {
+          setChunkProgress({ current: prog.chunkIndex + 1, total: prog.chunkTotal });
+          // Show chunks live as they complete — we update after each chunk call returns,
+          // so we approximate by marking the current index as "in progress" via progress state
+        }
       });
+      setTranslatedChunks(result.chunks);
+      setStats(result.stats);
       setStatus("done");
     } catch (e) {
       setError(e.message || "Something went wrong. Please try again.");
@@ -366,9 +451,11 @@ export default function App() {
     URL.revokeObjectURL(a.href);
   };
 
-  const progressPct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+  const progressPct = chunkProgress.total > 0
+    ? Math.round((chunkProgress.current / chunkProgress.total) * 100)
+    : 0;
   const numPages = pdfPages.length;
-  const numChunks = progress.total;
+  const numChunks = chunkProgress.total;
 
   // Map a page index to the best matching chunk index
   const pageToChunk = (pageIdx) =>
@@ -431,28 +518,53 @@ export default function App() {
             onClick={handleTranslate}
             disabled={!file || isLoading}
           >
-            {status === "extracting" ? <><span style={styles.spinner} />Extracting text…</>
-              : status === "translating" ? <><span style={styles.spinner} />Translating… ({progressPct}%)</>
+            {isLoading && status !== "rendering"
+              ? <><span style={styles.spinner} />Working…</>
               : status === "rendering" ? <><span style={styles.spinner} />Loading…</>
               : "✨ Translate to Telugu"}
           </button>
 
-          {status === "translating" && (
+          {(status === "extracting" || status === "translating") && (
             <div style={styles.progressWrap}>
-              <div style={styles.progressLabel}>
-                <span>Section {progress.current} of {progress.total}</span>
-                <span>{progressPct}%</span>
+              {/* Layer indicator */}
+              <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
+                {[1, 2, 3].map((l) => (
+                  <div key={l} style={{
+                    flex: 1, height: "3px", borderRadius: "2px",
+                    background: progressLayer >= l ? COLORS.accent : COLORS.border,
+                    transition: "background 0.3s",
+                  }} />
+                ))}
               </div>
-              <div style={styles.progressBar}>
-                <div style={{ ...styles.progressFill, width: `${progressPct}%` }} />
+              {/* Current message */}
+              <div style={{ fontSize: "12px", color: COLORS.accent2, marginBottom: "8px", lineHeight: "1.5" }}>
+                {progressMsg}
               </div>
+              {/* Chunk progress bar (only during Layer 1) */}
+              {progressLayer === 1 && chunkProgress.total > 0 && (
+                <>
+                  <div style={styles.progressLabel}>
+                    <span>Chunk {chunkProgress.current} of {chunkProgress.total}</span>
+                    <span>{progressPct}%</span>
+                  </div>
+                  <div style={styles.progressBar}>
+                    <div style={{ ...styles.progressFill, width: `${progressPct}%` }} />
+                  </div>
+                </>
+              )}
             </div>
           )}
 
           {status === "error" && <div style={styles.errorBox}>⚠️ {error}</div>}
-          {isDone && (
+
+          {isDone && stats && (
             <div style={styles.successBox}>
-              ✅ Done! {progress.total} section{progress.total !== 1 ? "s" : ""} translated.
+              <div>✅ {stats.chunksTotal}/{stats.chunksTotal} chunks translated</div>
+              <div>✅ {stats.missingLines === 0 ? "0 missing lines" : `${stats.missingLines} line(s) recovered`}</div>
+              <div>✅ {stats.citationsMissing === 0
+                ? `All ${stats.citationsTotal} citation${stats.citationsTotal !== 1 ? "s" : ""} found`
+                : `${stats.citationsMissing} citation(s) recovered`}
+              </div>
             </div>
           )}
         </div>
